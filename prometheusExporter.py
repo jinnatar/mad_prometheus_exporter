@@ -28,9 +28,9 @@ class MADCollector(object):
 
 
     def get_pokestop_metrics(self):
+        self._logger.debug('Fetching pokestop metrics')
         if not self._mapping_manager or not self._data_manager or not self._db:
             return
-
         self.metrics['area_count'] = GaugeMetricFamily('mad_area_count', 'Number of areas defined', labels=['type'])
         self.metrics['area_pokestop_count'] = GaugeMetricFamily('mad_area_pokestop_count', 'Number of pokestops', labels=['area'])
         self.metrics['area_quest_count'] = GaugeMetricFamily('mad_area_quest_count', 'Number of quests', labels=['area'])
@@ -48,10 +48,12 @@ class MADCollector(object):
 
                 self.metrics['area_pokestop_count'].add_metric([subfence], len(self._db.stops_from_db(fence=fence)))
                 self.metrics['area_quest_count'].add_metric([subfence], len(self._db.quests_from_db(fence=fence)))
+        self._logger.debug('Pokestop metrics done!')
 
     def get_device_metrics(self):
         if not self._mapping_manager or not self._mitm_mapper:
             return
+        self._logger.debug('Getting device metrics')
 
         self.metrics['device_count'] = GaugeMetricFamily('mad_device_count', 'Number of defined device origins')
         self.metrics['device_injection_status'] = GaugeMetricFamily('mad_device_injection_status', 'Boolean for whether injection is active', labels=['origin', 'scanmode'])
@@ -60,13 +62,23 @@ class MADCollector(object):
         devices = self._mapping_manager.get_all_devicemappings()
         self.metrics['device_count'].add_metric(value=len(devices), labels=[])
         for origin in devices.keys():
-            settings = self._mitm_mapper.request_latest(origin, 'injected_settings')['values']['scanmode']
-            scanmode = settings['values']['scanmode']
+            self._logger.debug(f'Processing metrics for {origin}')
+            settings = self._mitm_mapper.request_latest(origin, 'injected_settings')
+            if settings:
+                scanmode = settings['values']['scanmode']
+            else:
+                scanmode = 'unknown'
 
-            self.metrics['device_injection_status'].add_metric([origin, scanmode], int(self.__mitm_mapper.get_injection_status(origin)))
-            self.metrics['device_latest_data_timestamp'].add_metric([origin, scanmode], self.__mitm_mapper.request_latest(origin, 'timestamp_last_data'))
+            self._logger.debug(f'Injecting metrics for {origin}')
+            injection_status = int(self._mitm_mapper.get_injection_status(origin))
+            if injection_status:
+                self.metrics['device_injection_status'].add_metric([origin, scanmode], injection_status)
+            latest_data =  self._mitm_mapper.request_latest(origin, 'timestamp_last_data')
+            if latest_data:
+                self.metrics['device_latest_data_timestamp'].add_metric([origin, scanmode], latest_data)
             # origin_return[origin][
-            #     'last_possibly_moved'] = self.__mitm_mapper.get_last_timestamp_possible_moved(origin)
+            #     'last_possibly_moved'] = self._mitm_mapper.get_last_timestamp_possible_moved(origin)
+        self._logger.debug('Device metrics done!')
 
     def collect(self):
         """Run every time the endpoint is queried. All metrics are yielded.
