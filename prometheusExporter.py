@@ -176,4 +176,4 @@ class PrometheusExporter(mapadroid.utils.pluginBase.Plugin):
         return 'Registration great success.'
 
     def readme_route(self):
-        return 'Hello Kitty :3'
+        return 'For documentation, see: https://github.com/Artanicus/mad_prometheus_exporter/blob/main/README.md'
