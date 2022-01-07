@@ -4,25 +4,105 @@ from flask import Blueprint
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 
 import mapadroid.utils.pluginBase
-from mapadroid.madmin.functions import auth_required
+from mapadroid.madmin.functions import get_geofences, generate_coords_from_geofence
 
 from prometheus_client import make_wsgi_app
 from prometheus_client.core import GaugeMetricFamily, CounterMetricFamily, InfoMetricFamily, REGISTRY
 
 class MADCollector(object):
-    """Collect useful metrics to export.
+    """Collect useful metrics to export via a Prometheus /metrics endpoint.
     """
-    def __init__(self, mad):
+    def __init__(self, mad, devmode):
+        self.metrics = {}
+        self.devmode = devmode
+
         self._mad = mad
+        self._logger = mad['logger']
+        self._db = mad['db_wrapper']
+        self._mapping_manager = mad['mapping_manager']
+        self._mitm_mapper = mad['mitm_mapper']
+        self._data_manager = mad['data_manager']
+        self._madmin = mad['madmin']
+        self._ws_server = mad['ws_server']
+        self._jobstatus = mad['jobstatus']
+
+
+    def get_pokestop_metrics(self):
+        self._logger.debug('Fetching pokestop metrics')
+        if not self._mapping_manager or not self._data_manager or not self._db:
+            return
+        self.metrics['area_count'] = GaugeMetricFamily('mad_area_count', 'Number of areas defined', labels=['type'])
+        self.metrics['area_pokestop_count'] = GaugeMetricFamily('mad_area_pokestop_count', 'Number of pokestops', labels=['area'])
+        self.metrics['area_quest_count'] = GaugeMetricFamily('mad_area_quest_count', 'Number of quests', labels=['area'])
+
+        pokestop_areas = get_geofences(self._mapping_manager, self._data_manager, fence_type="pokestops")
+        processed_fences = []
+        self.metrics['area_count'].add_metric(['pokestops'], len(pokestop_areas))
+
+        for possible_fence in pokestop_areas:
+            for subfence in pokestop_areas[possible_fence]['include']:
+                if subfence in processed_fences:
+                    continue
+                processed_fences.append(subfence)
+                fence = generate_coords_from_geofence(self._mapping_manager, self._data_manager, subfence)
+
+                self.metrics['area_pokestop_count'].add_metric([subfence], len(self._db.stops_from_db(fence=fence)))
+                self.metrics['area_quest_count'].add_metric([subfence], len(self._db.quests_from_db(fence=fence)))
+        self._logger.debug('Pokestop metrics done!')
+
+    def get_device_metrics(self):
+        if not self._mapping_manager or not self._mitm_mapper:
+            return
+        self._logger.debug('Getting device metrics')
+
+        self.metrics['device_count'] = GaugeMetricFamily('mad_device_count', 'Number of defined device origins')
+        self.metrics['device_injection_status'] = GaugeMetricFamily('mad_device_injection_status', 'Boolean for whether injection is active', labels=['origin', 'scanmode'])
+        self.metrics['device_latest_data_timestamp'] = GaugeMetricFamily('mad_device_latest_data_timestamp', 'Timestamp of latest data received from device', labels=['origin', 'scanmode'])
+
+        devices = self._mapping_manager.get_all_devicemappings()
+        self.metrics['device_count'].add_metric(value=len(devices), labels=[])
+        for origin in devices.keys():
+            self._logger.debug(f'Processing metrics for {origin}')
+            settings = self._mitm_mapper.request_latest(origin, 'injected_settings')
+            if settings:
+                scanmode = settings['values']['scanmode']
+            else:
+                scanmode = 'unknown'
+
+            self._logger.debug(f'Injecting metrics for {origin}')
+            injection_status = int(self._mitm_mapper.get_injection_status(origin))
+            if injection_status:
+                self.metrics['device_injection_status'].add_metric([origin, scanmode], injection_status)
+            latest_data =  self._mitm_mapper.request_latest(origin, 'timestamp_last_data')
+            if latest_data:
+                self.metrics['device_latest_data_timestamp'].add_metric([origin, scanmode], latest_data)
+            # origin_return[origin][
+            #     'last_possibly_moved'] = self._mitm_mapper.get_last_timestamp_possible_moved(origin)
+        self._logger.debug('Device metrics done!')
 
     def collect(self):
-        yield GaugeMetricFamily('my_gauge', 'Help text', value=7)
-        c = CounterMetricFamily('my_counter_total', 'Help text', labels=['foo'])
-        c.add_metric(['bar'], 1.7)
-        c.add_metric(['baz'], 3.8)
-        yield c
-        yield InfoMetricFamily('madmin_state', str(dir(self._mad['madmin'].statistics)))
-        yield InfoMetricFamily('mad_statistics_stop_quest', str(self._mad['madmin'].statistics.get_stop_quest_stats_data()))
+        """Run every time the endpoint is queried. All metrics are yielded.
+        """
+        # reset metrics to avoid stale data
+        self.metrics = {}
+
+        # Run sub-processing functions that will populate the metrics with current values
+        self.get_pokestop_metrics()
+        self.get_device_metrics()
+
+        # yield all the metrics
+        for metric in self.metrics:
+            yield self.metrics[metric]
+
+        # When in devmode, export dummy metrics for exploring available internal objects
+        if self.devmode:
+            objs = []
+            for name, obj in self._mad.items():
+                if obj:
+                    objs.append((name, obj))
+            for name, obj in objs:
+                value = str(dir(obj))
+                yield InfoMetricFamily(f'mad_dev_{name}_dir', value)
 
 
 class PrometheusExporter(mapadroid.utils.pluginBase.Plugin):
@@ -34,6 +114,7 @@ class PrometheusExporter(mapadroid.utils.pluginBase.Plugin):
         self._rootdir = os.path.dirname(os.path.abspath(__file__))
 
         self._mad = mad
+        self._logger = mad['logger']
 
         self._pluginconfig.read(self._rootdir + "/plugin.ini")
         self._versionconfig.read(self._rootdir + "/version.mpl")
@@ -85,10 +166,14 @@ class PrometheusExporter(mapadroid.utils.pluginBase.Plugin):
         self._mad['madmin'].register_plugin(self._plugin)
         # do not change this part △△△△△△△△△△△△△△△
 
-        REGISTRY.register(MADCollector(self._mad))
+        # Since most of the work is done during endpoint requests, we just register the
+        # custom collector class to the Prometheus client library here.
+        # TODO(artanicus): Certain errors can cause this to hang and kill MAD startup without any logs being emitted. -_-
+        self._logger.info('Registering Prometheus metrics..')
+        devmode = self._pluginconfig.getboolean("plugin", "devmode", fallback=False)
+        REGISTRY.register(MADCollector(mad=self._mad, devmode=devmode))
 
-        return True
+        return 'Registration great success.'
 
-    @auth_required
     def readme_route(self):
         return 'Hello Kitty :3'
