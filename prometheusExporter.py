@@ -21,11 +21,24 @@ class MADCollector(object):
         self._db = mad['db_wrapper']
         self._mapping_manager = mad['mapping_manager']
         self._mitm_mapper = mad['mitm_mapper']
+        self._mitm_data_processor_manager = mad['mitm_data_processor_manager']
         self._data_manager = mad['data_manager']
         self._madmin = mad['madmin']
         self._ws_server = mad['ws_server']
         self._jobstatus = mad['jobstatus']
 
+
+    def get_mitm_metrics(self):
+        self._logger.debug('Fetching MiTM metrics')
+        if not self._mitm_data_processor_manager:
+            self._logger.error('No MiTM manager to query')
+            return
+        self.metrics['queue_size'] = GaugeMetricFamily('mad_mitm_queue_size', 'Size of MiTM processing queue')
+
+        queue_size = self._mitm_data_processor_manager.get_queue_size()
+        self.metrics['queue_size'].add_metric(value=queue_size, labels=[])
+
+        self._logger.debug('MiTM metrics done!')
 
     def get_pokestop_metrics(self):
         self._logger.debug('Fetching pokestop metrics')
@@ -87,6 +100,7 @@ class MADCollector(object):
         self.metrics = {}
 
         # Run sub-processing functions that will populate the metrics with current values
+        self.get_mitm_metrics()
         self.get_pokestop_metrics()
         self.get_device_metrics()
 
